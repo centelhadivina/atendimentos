@@ -1,0 +1,75 @@
+import { readFile } from 'node:fs/promises';
+import { pathToFileURL } from 'node:url';
+import assert from 'node:assert/strict';
+const { PGlite } = await import(pathToFileURL(process.env.PGLITE_MODULE));
+const db = new PGlite();
+let checks=0;
+const check=(a,b)=>{assert.deepEqual(a,b);checks++;};
+const fail=async fn=>{await assert.rejects(fn);checks++;};
+const ids={master:'10000000-0000-0000-0000-000000000001',cam:'10000000-0000-0000-0000-000000000002',tablet:'10000000-0000-0000-0000-000000000003',other:'10000000-0000-0000-0000-000000000004',later:'10000000-0000-0000-0000-000000000005'};
+async function login(id){await db.exec('reset role');await db.query("select set_config('request.jwt.claim.sub',$1,false)",[id]);await db.exec('set role authenticated');}
+try {
+ await db.exec(`create role anon;create role authenticated;create schema auth;
+ create table auth.users(id uuid primary key,email text unique,email_confirmed_at timestamptz,raw_user_meta_data jsonb);
+ create function auth.uid() returns uuid language sql stable as $$ select nullif(current_setting('request.jwt.claim.sub',true),'')::uuid $$;
+ create function auth.role() returns text language sql stable as $$ select 'authenticated'::text $$;
+ grant usage on schema auth to public;`);
+ await db.exec(await readFile(new URL('./fixtures/shared_registry.sql',import.meta.url),'utf8'));
+ await db.exec("update public.nucleos set sigla='CCU' where cod='001';insert into public.nucleos(cod,sigla,nome) values('002','CPO','Núcleo CPO');create table public.usuarios_sistema(id text primary key,nivel_permissao integer);insert into public.usuarios_sistema values('claudia-original',4);");
+ await db.exec(await readFile(new URL('../migrations/202610160002_existing_registry.sql',import.meta.url),'utf8'));
+ const insert=async(id,email,confirmed)=>db.query('insert into auth.users values($1,$2,$3,$4)',[id,email,confirmed?'2026-10-16T20:00:00Z':null,{name:'Nome',role:'admin'}]);
+ await insert(ids.master,'cinthiadutra@gmail.com',false);
+ await insert(ids.cam,'ccu.acentelhadivina@gmail.com',true);
+ await insert(ids.tablet,'tecnologia.ccu@gmail.com',true);
+ await insert(ids.other,'pessoa-claudia@example.com',true);
+ await db.exec(await readFile(new URL('../migrations/202610160003_consultation_accounts.sql',import.meta.url),'utf8'));
+ await login(ids.master);
+ check((await db.query('select app_private.is_admin() as result')).rows[0].result,false);
+ await fail(()=>db.query('select public.my_consultation_profile()'));
+ await db.exec('reset role');await db.query('update auth.users set email_confirmed_at=now() where id=$1',[ids.master]);
+ await login(ids.master);
+ check((await db.query('select app_private.is_admin() as result')).rows[0].result,true);
+ check((await db.query('select public.my_consultation_profile() as p')).rows[0].p.role,'admin');
+ check((await db.query('select * from public.list_consultation_nucleos()')).rows.length,2);
+ const ph=(await db.query('select id from public.phalanxes order by position')).rows.map(r=>r.id);
+ const medium=(await db.query('select public.save_medium($1::jsonb) as m',[{name:'Médium de teste',degree:'medium',ribbon:'green',nucleo_ids:['001'],guides:ph.map((id,i)=>({name:'Guia '+i,phalanx_id:id}))}])).rows[0].m;
+ const guide=(await db.query('select id from public.guides where medium_id=$1 and phalanx_id=$2',[medium.id,ph[0]])).rows[0].id;
+
+ await login(ids.cam);
+ let profile=(await db.query('select public.my_consultation_profile() as p')).rows[0].p;
+ check(profile.role,'cambono');check(profile.user_nucleos,[{nucleo_id:'001'}]);
+ check((await db.query("select app_private.can_access('002') as ok")).rows[0].ok,false);
+ const session=(await db.query('select public.configure_session($1::jsonb) as s',[{nucleo_id:'001',phalanx_id:ph[0],duration_minutes:30,consultation_limit:3}])).rows[0].s;
+ await db.query('select public.set_presence($1,$2,true)',[session.id,medium.id]);
+ const consultation=(await db.query('select public.open_consultation($1::jsonb) as c',[{session_id:session.id,medium_id:medium.id,guide_id:guide,password:'001',consultant_name:'Pessoa de teste'}])).rows[0].c;
+ check(consultation.status,'in_progress');
+
+ await fail(()=>db.query('select * from app_private.consultation_accounts'));
+ await fail(()=>db.query('select app_private.sync_consultation_account($1)',[ids.cam]));
+ await fail(()=>db.query("update public.profiles set role='admin' where id=$1",[ids.cam]));
+ await login(ids.tablet);
+ check((await db.query('select public.my_consultation_profile() as p')).rows[0].p.role,'tablet');
+ check((await db.query('select public.finish_consultation($1,5,$2) as c',[consultation.id,'Feedback de teste'])).rows[0].c.status,'completed');
+
+ await fail(()=>db.query("select public.configure_session('{}'::jsonb)"));
+ await login(ids.other);
+ check((await db.query('select * from public.phalanxes')).rows.length,0);
+ check((await db.query('select * from public.list_consultation_nucleos()')).rows.length,0);
+ await fail(()=>db.query('select public.my_consultation_profile()'));
+ await db.exec('reset role');
+ check((await db.query('select * from public.usuarios_sistema')).rows,[{id:'claudia-original',nivel_permissao:4}]);
+ await insert(ids.later,'tecnologia.cpo@outlook.com',false);
+ check((await db.query('select count(*)::int as n from public.profiles where id=$1',[ids.later])).rows[0].n,0);
+ await db.query('update auth.users set email_confirmed_at=now() where id=$1',[ids.later]);
+ await login(ids.later);
+ profile=(await db.query('select public.my_consultation_profile() as p')).rows[0].p;
+ check(profile.role,'tablet');check(profile.user_nucleos,[{nucleo_id:'002'}]);
+ await db.exec('reset role');
+ await db.query("update auth.users set email='master-alterado@example.com' where id=$1",[ids.master]);
+ await login(ids.master);
+ check((await db.query('select app_private.is_admin() as ok')).rows[0].ok,false);
+ await fail(()=>db.query('select public.my_consultation_profile()'));
+ await db.exec('reset role');await db.exec('set role anon');
+ await fail(()=>db.query('select public.my_consultation_profile()'));
+ console.log(`Contas: ${checks} verificações passaram; master verificado, perfis/núcleos e Cláudia separados.`);
+} finally {await db.close();}

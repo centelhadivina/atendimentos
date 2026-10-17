@@ -1,0 +1,6 @@
+project_id = "centelha-consultas"
+
+# Entrada pública e compartilhada, como os botões de acesso rápido do React.
+# Somente cambono/tablet nos dois núcleos previstos; não autentica admin.
+[functions.consultation-quick-access]
+verify_jwt = false
